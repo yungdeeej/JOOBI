@@ -11,6 +11,7 @@ import {
   serial,
   bigserial,
   index,
+  unique,
 } from 'drizzle-orm/pg-core';
 
 export const swapStateEnum = pgEnum('swap_state', [
@@ -113,6 +114,21 @@ export const supportedTokens = pgTable('supported_tokens', {
   maxSwapUsd: numeric('max_swap_usd', { precision: 12, scale: 2 }).notNull().default('5000'),
   isActive: boolean('is_active').notNull().default(true),
 });
+
+export const webhookEvents = pgTable(
+  'webhook_events',
+  {
+    id: bigserial('id', { mode: 'number' }).primaryKey(),
+    provider: text('provider').notNull(),
+    externalId: text('external_id').notNull(),
+    payloadHash: text('payload_hash'),
+    receivedAt: timestamp('received_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    receivedAtIdx: index('idx_webhook_events_received_at').on(t.receivedAt),
+    uniq: unique('webhook_events_unique').on(t.provider, t.externalId),
+  }),
+);
 
 export type Swap = typeof swaps.$inferSelect;
 export type NewSwap = typeof swaps.$inferInsert;

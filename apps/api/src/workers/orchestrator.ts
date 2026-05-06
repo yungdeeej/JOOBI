@@ -2,22 +2,29 @@ import { Worker } from 'bullmq';
 import { eq } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import { swaps, swapEvents } from '../db/schema.js';
-import { ORCHESTRATOR_QUEUE, redis, type OrchestratorJobData } from '../lib/queue.js';
-import { logger } from '../lib/logger.js';
+import {
+  ORCHESTRATOR_QUEUE,
+  redis,
+  enqueueOrchestrator,
+  type OrchestratorJobData,
+} from '../lib/queue.js';
+import { logger, redactAddress } from '../lib/logger.js';
 import { stubSymbiosisService } from '../services/symbiosis.js';
 import { stubStonFiService } from '../services/stonfi.js';
 import { stubTonClient } from '../services/ton-client.js';
 import { stubPrivyService } from '../services/privy.js';
 import type { SwapState } from '@joobi/shared';
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+interface TransitionPatch {
+  patch?: Partial<typeof swaps.$inferInsert>;
+  payload?: Record<string, unknown>;
+}
 
-const transition = async (
+const writeTransition = async (
   swapId: string,
   fromState: SwapState,
   toState: SwapState,
-  payload: Record<string, unknown> = {},
-  patch: Record<string, unknown> = {},
+  { patch = {}, payload = {} }: TransitionPatch = {},
 ) => {
   await db
     .update(swaps)
@@ -29,7 +36,10 @@ const transition = async (
     toState,
     payload,
   });
-  logger.info({ swapId, fromState, toState }, 'state transition');
+  logger.info(
+    { swapId: redactAddress(swapId), fromState, toState },
+    'state transition',
+  );
 };
 
 const fetchSwap = async (swapId: string) => {
@@ -37,102 +47,132 @@ const fetchSwap = async (swapId: string) => {
   return rows[0] ?? null;
 };
 
-const runStateMachine = async (swapId: string) => {
-  let swap = await fetchSwap(swapId);
-  if (!swap) return;
+interface AdvanceResult {
+  /** Next state to wake on, or null if terminal/idle. */
+  nextDelayMs: number | null;
+}
 
-  // WAITING_DEPOSIT -> DEPOSIT_DETECTED
-  if (swap.state === 'WAITING_DEPOSIT') {
-    const fakeTx = `dep_${swapId.slice(0, 8)}_${Date.now()}`;
-    await transition(swapId, 'WAITING_DEPOSIT', 'DEPOSIT_DETECTED', { txHash: fakeTx }, {
-      depositTxHash: swap.depositTxHash ?? fakeTx,
-      actualReceivedAmount: swap.sourceAmount,
-    });
-    swap = (await fetchSwap(swapId))!;
-  }
+/**
+ * Run a single state transition for a swap. Returns the delay before the
+ * next job should fire, or null if no further work is queued.
+ */
+const advanceOnce = async (swapId: string): Promise<AdvanceResult> => {
+  const swap = await fetchSwap(swapId);
+  if (!swap) return { nextDelayMs: null };
 
-  if (swap.state === 'DEPOSIT_DETECTED') {
-    await sleep(2000);
-    await transition(swapId, 'DEPOSIT_DETECTED', 'DEPOSIT_CONFIRMED');
-    swap = (await fetchSwap(swapId))!;
-  }
+  switch (swap.state) {
+    case 'WAITING_DEPOSIT': {
+      const fakeTx = swap.depositTxHash ?? `dep_${swapId.slice(0, 8)}_${Date.now()}`;
+      await writeTransition(swapId, 'WAITING_DEPOSIT', 'DEPOSIT_DETECTED', {
+        patch: {
+          depositTxHash: fakeTx,
+          actualReceivedAmount: swap.sourceAmount,
+        },
+        payload: { txHash: fakeTx },
+      });
+      return { nextDelayMs: 2000 };
+    }
 
-  if (swap.state === 'DEPOSIT_CONFIRMED') {
-    const symQuote = await stubSymbiosisService.getQuote({
-      fromChainId: 7565164,
-      toChainId: 85918,
-      fromTokenAddress: '',
-      toTokenAddress: '',
-      amount: swap.sourceAmount,
-      fromAddress: swap.depositAddress,
-      toAddress: swap.destinationAddress,
-      slippage: swap.slippageBps,
-      partnerId: 'joobiswap',
-    });
-    const sigBase64 = Buffer.from(`tx_${swapId}`).toString('base64');
-    const bridgeSourceTx = await stubPrivyService.signSolanaTransaction(
-      swap.privyWalletId,
-      sigBase64,
-    );
-    await transition(swapId, 'DEPOSIT_CONFIRMED', 'BRIDGING', { symbiosisQuoteId: symQuote.quoteId }, {
-      bridgeTxHashSource: bridgeSourceTx,
-      symbiosisQuoteId: symQuote.quoteId,
-    });
-    swap = (await fetchSwap(swapId))!;
-  }
+    case 'DEPOSIT_DETECTED': {
+      await writeTransition(swapId, 'DEPOSIT_DETECTED', 'DEPOSIT_CONFIRMED');
+      return { nextDelayMs: 0 };
+    }
 
-  if (swap.state === 'BRIDGING') {
-    await sleep(5000);
-    const tracked = await stubSymbiosisService.trackSwap({
-      chainId: 7565164,
-      txHash: swap.bridgeTxHashSource ?? '',
-    });
-    await transition(swapId, 'BRIDGING', 'BRIDGE_CONFIRMED', { tracked }, {
-      bridgeTxHashDestination: tracked.destinationTxHash ?? null,
-      actualBridgedAmount: tracked.outputAmount ?? swap.quotedDestinationAmount,
-    });
-    swap = (await fetchSwap(swapId))!;
-  }
+    case 'DEPOSIT_CONFIRMED': {
+      const symQuote = await stubSymbiosisService.getQuote({
+        fromChainId: 7565164,
+        toChainId: 85918,
+        fromTokenAddress: '',
+        toTokenAddress: '',
+        amount: swap.sourceAmount,
+        fromAddress: swap.depositAddress,
+        toAddress: swap.destinationAddress,
+        slippage: swap.slippageBps,
+        partnerId: 'joobiswap',
+      });
+      const sigBase64 = Buffer.from(`tx_${swapId}`).toString('base64');
+      const bridgeSourceTx = await stubPrivyService.signSolanaTransaction(
+        swap.privyWalletId,
+        sigBase64,
+      );
+      await writeTransition(swapId, 'DEPOSIT_CONFIRMED', 'BRIDGING', {
+        patch: {
+          bridgeTxHashSource: bridgeSourceTx,
+          symbiosisQuoteId: symQuote.quoteId,
+        },
+        payload: { symbiosisQuoteId: symQuote.quoteId },
+      });
+      return { nextDelayMs: 5000 };
+    }
 
-  if (swap.state === 'BRIDGE_CONFIRMED') {
-    if (swap.destinationToken === 'TON') {
-      // skip swap step
-      await transition(swapId, 'BRIDGE_CONFIRMED', 'SENDING_TO_USER');
-    } else {
+    case 'BRIDGING': {
+      const tracked = await stubSymbiosisService.trackSwap({
+        chainId: 7565164,
+        txHash: swap.bridgeTxHashSource ?? '',
+      });
+      await writeTransition(swapId, 'BRIDGING', 'BRIDGE_CONFIRMED', {
+        patch: {
+          bridgeTxHashDestination: tracked.destinationTxHash ?? null,
+          actualBridgedAmount: tracked.outputAmount ?? swap.quotedDestinationAmount,
+        },
+        payload: { tracked },
+      });
+      return { nextDelayMs: 0 };
+    }
+
+    case 'BRIDGE_CONFIRMED': {
+      if (swap.destinationToken === 'TON') {
+        await writeTransition(swapId, 'BRIDGE_CONFIRMED', 'SENDING_TO_USER');
+        return { nextDelayMs: 2000 };
+      }
       const stonQuote = await stubStonFiService.getJoobiQuote(
         swap.actualBridgedAmount ?? swap.quotedDestinationAmount ?? '0',
       );
-      await transition(swapId, 'BRIDGE_CONFIRMED', 'SWAPPING_TO_DESTINATION', { stonQuote });
+      await writeTransition(swapId, 'BRIDGE_CONFIRMED', 'SWAPPING_TO_DESTINATION', {
+        payload: { stonQuote },
+      });
+      return { nextDelayMs: 3000 };
     }
-    swap = (await fetchSwap(swapId))!;
-  }
 
-  if (swap.state === 'SWAPPING_TO_DESTINATION') {
-    await sleep(3000);
-    const stonResult = await stubTonClient.sendBoc('stub-boc');
-    await transition(swapId, 'SWAPPING_TO_DESTINATION', 'DESTINATION_SWAP_CONFIRMED', { txHash: stonResult.txHash }, {
-      destinationSwapTxHash: stonResult.txHash,
-    });
-    swap = (await fetchSwap(swapId))!;
-  }
+    case 'SWAPPING_TO_DESTINATION': {
+      const stonResult = await stubTonClient.sendBoc('stub-boc');
+      await writeTransition(
+        swapId,
+        'SWAPPING_TO_DESTINATION',
+        'DESTINATION_SWAP_CONFIRMED',
+        {
+          patch: { destinationSwapTxHash: stonResult.txHash },
+          payload: { txHash: stonResult.txHash },
+        },
+      );
+      return { nextDelayMs: 0 };
+    }
 
-  if (swap.state === 'DESTINATION_SWAP_CONFIRMED') {
-    await transition(swapId, 'DESTINATION_SWAP_CONFIRMED', 'SENDING_TO_USER');
-    swap = (await fetchSwap(swapId))!;
-  }
+    case 'DESTINATION_SWAP_CONFIRMED': {
+      await writeTransition(swapId, 'DESTINATION_SWAP_CONFIRMED', 'SENDING_TO_USER');
+      return { nextDelayMs: 2000 };
+    }
 
-  if (swap.state === 'SENDING_TO_USER') {
-    await sleep(2000);
-    const payout = await stubTonClient.sendBoc('stub-payout-boc');
-    const finalAmount =
-      swap.destinationToken === 'JOOBI'
-        ? swap.quotedDestinationAmount
-        : swap.actualBridgedAmount ?? swap.quotedDestinationAmount;
-    await transition(swapId, 'SENDING_TO_USER', 'COMPLETED', { txHash: payout.txHash }, {
-      payoutTxHash: payout.txHash,
-      actualDestinationAmount: finalAmount,
-    });
-    await stubPrivyService.destroyWallet(swap.privyWalletId);
+    case 'SENDING_TO_USER': {
+      const payout = await stubTonClient.sendBoc('stub-payout-boc');
+      const finalAmount =
+        swap.destinationToken === 'JOOBI'
+          ? swap.quotedDestinationAmount
+          : (swap.actualBridgedAmount ?? swap.quotedDestinationAmount);
+      await writeTransition(swapId, 'SENDING_TO_USER', 'COMPLETED', {
+        patch: {
+          payoutTxHash: payout.txHash,
+          actualDestinationAmount: finalAmount,
+        },
+        payload: { txHash: payout.txHash },
+      });
+      await stubPrivyService.destroyWallet(swap.privyWalletId);
+      return { nextDelayMs: null };
+    }
+
+    // Terminal / non-advancing states.
+    default:
+      return { nextDelayMs: null };
   }
 };
 
@@ -140,26 +180,43 @@ export const startOrchestratorWorker = () => {
   const worker = new Worker<OrchestratorJobData>(
     ORCHESTRATOR_QUEUE,
     async (job) => {
-      const { swapId } = job.data;
-      try {
-        await runStateMachine(swapId);
-      } catch (err) {
-        logger.error({ err, swapId }, 'orchestrator failed');
-        await db
-          .update(swaps)
-          .set({
-            state: 'MANUAL_REVIEW',
-            errorMessage: err instanceof Error ? err.message : String(err),
-            updatedAt: new Date(),
-          })
-          .where(eq(swaps.id, swapId));
+      const { swapId, expectFrom } = job.data;
+      const current = await fetchSwap(swapId);
+      if (!current) return;
+      if (expectFrom && current.state !== expectFrom) {
+        logger.debug(
+          { swapId: redactAddress(swapId), expectFrom, actual: current.state },
+          'state advanced by another worker — skipping',
+        );
+        return;
+      }
+      const next = await advanceOnce(swapId);
+      if (next.nextDelayMs !== null) {
+        const after = await fetchSwap(swapId);
+        if (after) {
+          await enqueueOrchestrator(
+            { swapId, reason: 'tick', expectFrom: after.state },
+            { delay: next.nextDelayMs, jobId: `${swapId}:${after.state}` },
+          );
+        }
       }
     },
-    { connection: redis, concurrency: 4 },
+    { connection: redis, concurrency: 8 },
   );
 
-  worker.on('failed', (job, err) => {
-    logger.error({ jobId: job?.id, err }, 'orchestrator worker job failed');
+  worker.on('failed', async (job, err) => {
+    logger.error({ jobId: job?.id, err }, 'orchestrator job failed');
+    if (job?.data?.swapId) {
+      await db
+        .update(swaps)
+        .set({
+          state: 'MANUAL_REVIEW',
+          errorMessage: err instanceof Error ? err.message : String(err),
+          updatedAt: new Date(),
+        })
+        .where(eq(swaps.id, job.data.swapId));
+    }
   });
+
   return worker;
 };

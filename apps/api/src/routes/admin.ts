@@ -1,14 +1,14 @@
-import { Router } from 'express';
+import { Router, type Request } from 'express';
 import { eq } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import { swaps } from '../db/schema.js';
 import { env } from '../lib/env.js';
-import { orchestratorQueue } from '../lib/queue.js';
+import { enqueueOrchestrator } from '../lib/queue.js';
 import { NotFoundError, UnauthorizedError } from '../lib/errors.js';
 
 export const adminRouter = Router();
 
-const requireAdmin = (req: import('express').Request) => {
+const requireAdmin = (req: Request) => {
   const auth = req.header('authorization') ?? '';
   const token = auth.replace(/^Bearer\s+/i, '');
   if (!token || token !== env.ADMIN_API_TOKEN) {
@@ -16,27 +16,23 @@ const requireAdmin = (req: import('express').Request) => {
   }
 };
 
+const findSwapByIdOrPublicId = async (idOrPublic: string) => {
+  const byId = await db.select().from(swaps).where(eq(swaps.id, idOrPublic)).limit(1);
+  if (byId[0]) return byId[0];
+  const byPublic = await db.select().from(swaps).where(eq(swaps.publicId, idOrPublic)).limit(1);
+  return byPublic[0] ?? null;
+};
+
 adminRouter.post('/swaps/:id/simulate-deposit', async (req, res, next) => {
   try {
     if (env.NODE_ENV === 'production') {
       throw new UnauthorizedError('simulate-deposit disabled in production');
     }
-    const id = req.params.id!;
-    const matches = await db
-      .select()
-      .from(swaps)
-      .where(eq(swaps.id, id))
-      .limit(1);
-    let swap = matches[0];
-    if (!swap) {
-      const byPublic = await db.select().from(swaps).where(eq(swaps.publicId, id)).limit(1);
-      swap = byPublic[0];
-    }
+    const swap = await findSwapByIdOrPublicId(req.params.id!);
     if (!swap) throw new NotFoundError('Swap not found');
-    await orchestratorQueue.add(
-      'simulate',
-      { swapId: swap.id, reason: 'simulate-deposit' },
-      { jobId: `sim-${swap.id}-${Date.now()}` },
+    await enqueueOrchestrator(
+      { swapId: swap.id, reason: 'simulate-deposit', expectFrom: 'WAITING_DEPOSIT' },
+      { jobId: `${swap.id}:WAITING_DEPOSIT` },
     );
     res.json({ ok: true, swapId: swap.id, publicId: swap.publicId });
   } catch (err) {
@@ -47,8 +43,7 @@ adminRouter.post('/swaps/:id/simulate-deposit', async (req, res, next) => {
 adminRouter.post('/swaps/:id/refund', async (req, res, next) => {
   try {
     requireAdmin(req);
-    const matches = await db.select().from(swaps).where(eq(swaps.id, req.params.id!)).limit(1);
-    const swap = matches[0];
+    const swap = await findSwapByIdOrPublicId(req.params.id!);
     if (!swap) throw new NotFoundError('Swap not found');
     await db
       .update(swaps)
@@ -63,13 +58,11 @@ adminRouter.post('/swaps/:id/refund', async (req, res, next) => {
 adminRouter.post('/swaps/:id/retry', async (req, res, next) => {
   try {
     requireAdmin(req);
-    const matches = await db.select().from(swaps).where(eq(swaps.id, req.params.id!)).limit(1);
-    const swap = matches[0];
+    const swap = await findSwapByIdOrPublicId(req.params.id!);
     if (!swap) throw new NotFoundError('Swap not found');
-    await orchestratorQueue.add(
-      'retry',
-      { swapId: swap.id, reason: 'tick' },
-      { jobId: `retry-${swap.id}-${Date.now()}` },
+    await enqueueOrchestrator(
+      { swapId: swap.id, reason: 'retry' },
+      { jobId: `${swap.id}:retry:${Date.now()}` },
     );
     res.json({ ok: true });
   } catch (err) {

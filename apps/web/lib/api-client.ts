@@ -14,6 +14,21 @@ const handle = async <T>(res: Response): Promise<T> => {
   return res.json() as Promise<T>;
 };
 
+export interface RecentSwap {
+  id: string;
+  sourceToken: string;
+  destinationToken: string;
+  sourceAmount: string;
+  destinationAmount: string | null;
+  createdAt: string;
+}
+
+export interface StatsSummary {
+  total: number;
+  completed: number;
+  active: number;
+}
+
 export const apiClient = {
   async getQuote(params: {
     sourceToken: string;
@@ -45,5 +60,13 @@ export const apiClient = {
   async getSwap(publicId: string) {
     const res = await fetch(`${baseUrl}/swaps/${publicId}`);
     return handle<SwapStatusResponse>(res);
+  },
+  async getStats() {
+    const res = await fetch(`${baseUrl}/stats/summary`);
+    return handle<StatsSummary>(res);
+  },
+  async getRecentSwaps() {
+    const res = await fetch(`${baseUrl}/stats/recent`);
+    return handle<RecentSwap[]>(res);
   },
 };

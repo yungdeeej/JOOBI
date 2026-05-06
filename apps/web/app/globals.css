@@ -3,14 +3,78 @@
 @tailwind utilities;
 
 :root {
-  color-scheme: light dark;
+  color-scheme: dark;
 }
 
-html, body {
+html,
+body {
   height: 100%;
 }
 
 body {
-  background: linear-gradient(180deg, #0f0a1f 0%, #1a1235 100%);
-  color: #f5f3ff;
+  background-color: #09090b;
+  color: #fafafa;
+  font-feature-settings: 'cv11', 'ss01';
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Subtle background mesh on the whole page */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  background-image:
+    radial-gradient(at 15% 0%, rgba(139, 92, 246, 0.18), transparent 50%),
+    radial-gradient(at 85% 30%, rgba(217, 70, 239, 0.10), transparent 50%),
+    radial-gradient(at 30% 100%, rgba(56, 189, 248, 0.08), transparent 50%);
+  pointer-events: none;
+  z-index: -1;
+}
+
+/* Card surface utility */
+@layer components {
+  .surface {
+    @apply rounded-2xl border border-white/[0.06] bg-white/[0.02] backdrop-blur-xl;
+  }
+  .surface-elevated {
+    @apply rounded-2xl border border-white/[0.08] bg-white/[0.04] backdrop-blur-xl shadow-soft;
+  }
+  .input-base {
+    @apply w-full rounded-xl border border-white/[0.06] bg-black/30 px-4 py-3 text-zinc-100 placeholder-zinc-500 transition focus:border-brand-400/50 focus:outline-none focus:ring-2 focus:ring-brand-500/20;
+  }
+  .btn-primary {
+    @apply inline-flex items-center justify-center gap-2 rounded-xl bg-gradient-brand px-5 py-3 text-sm font-semibold text-white shadow-glow transition hover:brightness-110 active:brightness-95 disabled:cursor-not-allowed disabled:opacity-40 disabled:shadow-none;
+  }
+  .btn-ghost {
+    @apply inline-flex items-center justify-center gap-2 rounded-xl border border-white/[0.08] bg-white/[0.02] px-4 py-2 text-sm font-medium text-zinc-300 transition hover:bg-white/[0.05] hover:text-white;
+  }
+  .btn-icon {
+    @apply inline-flex items-center justify-center rounded-lg border border-white/[0.06] bg-white/[0.03] p-2 text-zinc-400 transition hover:bg-white/[0.08] hover:text-white;
+  }
+  .chip {
+    @apply inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-xs font-medium ring-1 ring-inset;
+  }
+}
+
+/* Scrollbar polish */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.16);
+}
+
+/* Selection */
+::selection {
+  background: rgba(139, 92, 246, 0.4);
+  color: #fff;
 }
