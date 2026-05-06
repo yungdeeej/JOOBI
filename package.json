@@ -1,0 +1,25 @@
+{
+  "name": "joobiswap",
+  "version": "0.1.0",
+  "private": true,
+  "engines": {
+    "node": ">=20"
+  },
+  "packageManager": "pnpm@9.0.0",
+  "scripts": {
+    "dev": "pnpm -r --parallel --filter \"./apps/*\" run dev",
+    "build": "pnpm -r --filter \"./packages/*\" run build && pnpm -r --filter \"./apps/*\" run build",
+    "start": "pnpm -r --parallel --filter \"./apps/*\" run start",
+    "db:migrate": "pnpm --filter @joobi/api run db:migrate",
+    "db:seed": "pnpm --filter @joobi/api run db:seed",
+    "audit:joobi": "pnpm --filter @joobi/api run audit:joobi",
+    "test": "pnpm -r run test",
+    "lint": "pnpm -r run lint",
+    "typecheck": "pnpm -r run typecheck"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.5",
+    "tsx": "^4.7.2",
+    "prettier": "^3.2.5"
+  }
+}
